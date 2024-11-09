@@ -1,0 +1,38 @@
+{
+  "statistics": {
+    "movielens": {
+      "total_users": 200948,
+      "total_movies": 87585,
+      "total_ratings": 32000204,
+      "total_tags": 2000072
+    },
+    "netflix": {
+      "total_movies": 17770,
+      "total_ratings": 100480507,
+      "year_range": {
+        "min": 1896,
+        "max": 2005
+      }
+    },
+    "tmdb": {
+      "total_actors": 1196793,
+      "total_movies": 6725413,
+      "total_tv_shows": 605850
+    },
+    "ratings_distribution": {
+      "movielens": {
+        "mean": 3.5403956487277393,
+        "median": 3.5,
+        "std": 1.0589862139453103,
+        "count": 32000204
+      },
+      "netflix": {
+        "mean": 3.604289964420661,
+        "median": 4.0,
+        "std": 1.08521856462956,
+        "count": 100480507
+      }
+    }
+  },
+  "timestamp": "2024-10-29T11:19:59.551496"
+}
