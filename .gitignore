@@ -33,11 +33,7 @@ ml-32m/movies.csv
 ml-32m/ratings.csv
 ml-32m/README.txt
 ml-32m/tags.csv
-<<<<<<< HEAD
 CineSync-Training-Dataset.zip
-
-=======
->>>>>>> 16c7a07842da2b5b6f39386fcca130e719283acb
 
 # AWS User-specific
 .idea/**/aws.xml
