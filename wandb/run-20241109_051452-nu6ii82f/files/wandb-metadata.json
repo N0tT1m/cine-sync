@@ -1,0 +1,43 @@
+{
+  "os":  "Windows-11-10.0.22631-SP0",
+  "python":  "3.12.4",
+  "startedAt":  "2024-11-09T10:14:52.703309Z",
+  "program":  "E:\\workspace\\ai-apps\\PeachBloom\\main.py",
+  "codePath":  "main.py",
+  "git":  {
+    "remote":  "git@github.com:N0tT1m/CineSync.git",
+    "commit":  "34b135c647e7a583238ef967d0563b55cbcb7d4e"
+  },
+  "email":  "nathan.moritz@duocore.dev",
+  "root":  "E:\\workspace\\ai-apps\\PeachBloom",
+  "host":  "Ryzen-Win",
+  "username":  "natei",
+  "executable":  "E:\\workspace\\ai-apps\\PeachBloom\\.venv\\Scripts\\python.exe",
+  "codePathLocal":  "main.py",
+  "cpu_count":  12,
+  "cpu_count_logical":  24,
+  "gpu":  "NVIDIA GeForce RTX 4090",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "4000785100800",
+      "used":  "20010483712"
+    }
+  },
+  "memory":  {
+    "total":  "51436146688"
+  },
+  "cpu":  {
+    "count":  12,
+    "countLogical":  24
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 4090",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  16384,
+      "architecture":  "Ada"
+    }
+  ],
+  "cudaVersion":  "12.7"
+}

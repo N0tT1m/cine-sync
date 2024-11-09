@@ -1,6 +1,8 @@
+import sys
+
 import pandas as pd
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import logging
@@ -8,13 +10,14 @@ import os
 from pathlib import Path
 
 import torch
+from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizerBase,
-    get_linear_schedule_with_warmup
+    get_linear_schedule_with_warmup, PreTrainedTokenizer
 )
 from pathlib import Path
 import time
@@ -297,6 +300,94 @@ class MovieDataProcessor:
             logger.error(f"Error exporting processed data: {e}")
             raise
 
+    def _prepare_training_texts(self) -> List[str]:
+        """Prepare text data for training from all available sources"""
+        training_texts = []
+
+        # Process MovieLens data
+        if self.movielens_data and 'movies' in self.movielens_data:
+            for _, movie in self.movielens_data['movies'].iterrows():
+                text = f"Movie Title: {movie['title']}\nGenres: {' | '.join(movie['genres'])}\n\n"
+                training_texts.append(text)
+
+        # Process Netflix data
+        if self.netflix_data and 'movies' in self.netflix_data:
+            for _, movie in self.netflix_data['movies'].iterrows():
+                year = str(movie['year']) if pd.notna(movie['year']) else 'Unknown'
+                text = f"Movie Title: {movie['title']}\nYear: {year}\n\n"
+                training_texts.append(text)
+
+        # Process TMDB actor data
+        if self.actors_data:
+            for actor_id, actor in self.actors_data.items():
+                credits_text = "\n".join([
+                    f"Title: {credit.title}\n"
+                    f"Role: {credit.character}\n"
+                    f"Type: {credit.media_type}\n"
+                    f"Genres: {' | '.join(credit.genres)}\n"
+                    for credit in actor.credits[:5]  # Limit to top 5 credits
+                ])
+
+                text = f"Actor: {actor.name}\nPopularity: {actor.popularity}\n\nCredits:\n{credits_text}\n\n"
+                training_texts.append(text)
+
+        return training_texts
+
+    def create_datasets(
+            self,
+            tokenizer: PreTrainedTokenizer,
+            max_length: int = 512,
+            train_size: float = 0.8,
+            val_size: float = 0.1,
+            test_size: float = 0.1,
+            random_state: int = 42
+    ) -> Tuple[Dataset, Dataset, Dataset]:
+        """
+        Create training, validation, and test datasets from the processed movie data.
+
+        Args:
+            tokenizer: The tokenizer to use for encoding the texts
+            max_length: Maximum sequence length for the model
+            train_size: Proportion of data to use for training
+            val_size: Proportion of data to use for validation
+            test_size: Proportion of data to use for testing
+            random_state: Random seed for reproducibility
+
+        Returns:
+            Tuple of (train_dataset, val_dataset, test_dataset)
+        """
+        logger.info("Preparing training texts...")
+        all_texts = self._prepare_training_texts()
+
+        if not all_texts:
+            raise ValueError("No training texts available. Please ensure data is loaded properly.")
+
+        logger.info(f"Created {len(all_texts)} training examples")
+
+        # First split: separate test set
+        train_val_texts, test_texts = train_test_split(
+            all_texts,
+            test_size=test_size,
+            random_state=random_state
+        )
+
+        # Second split: separate train and validation sets
+        relative_val_size = val_size / (train_size + val_size)
+        train_texts, val_texts = train_test_split(
+            train_val_texts,
+            test_size=relative_val_size,
+            random_state=random_state
+        )
+
+        logger.info(f"Split sizes - Train: {len(train_texts)}, Val: {len(val_texts)}, Test: {len(test_texts)}")
+
+        # Create datasets
+        train_dataset = MovieDataset(train_texts, tokenizer, max_length)
+        val_dataset = MovieDataset(val_texts, tokenizer, max_length)
+        test_dataset = MovieDataset(test_texts, tokenizer, max_length)
+
+        return train_dataset, val_dataset, test_dataset
+
 # Add new TrainingConfig dataclass
 @dataclass
 class TrainingConfig:
@@ -313,6 +404,27 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     use_wandb: bool = True
 
+class MovieDataset(Dataset):
+    def __init__(self, texts: List[str], tokenizer: PreTrainedTokenizer, max_length: int = 512):
+        self.encodings = tokenizer(
+            texts,
+            truncation=True,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
+        self.labels = self.encodings['input_ids'].clone()
+
+    def __len__(self):
+        return len(self.encodings['input_ids'])
+
+    def __getitem__(self, idx):
+        return {
+            'input_ids': self.encodings['input_ids'][idx],
+            'attention_mask': self.encodings['attention_mask'][idx],
+            'labels': self.labels[idx]
+        }
+
 
 class MovieLLMTrainer:
     def __init__(self, config: TrainingConfig, model: PreTrainedModel,
@@ -328,10 +440,11 @@ class MovieLLMTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self.model.to(self.device)
 
-        # Initialize optimizer
+        # Initialize optimizer with gradient clipping
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=config.learning_rate
+            lr=config.learning_rate,
+            eps=1e-8  # Add epsilon for numerical stability
         )
 
         # Calculate total training steps
@@ -354,9 +467,31 @@ class MovieLLMTrainer:
         self.best_val_loss = float('inf')
         self.start_time = time.time()
 
-        # Initialize wandb if enabled
+        # Initialize wandb with retry mechanism and error handling
         if config.use_wandb:
-            wandb.init(project="movie-llm-training", config=vars(config))
+            self._init_wandb_with_retry()
+
+    def _init_wandb_with_retry(self, max_retries=3, retry_delay=5):
+        """Initialize wandb with retry mechanism"""
+        for attempt in range(max_retries):
+            try:
+                if wandb.run is not None:
+                    wandb.finish()
+                wandb.init(
+                    project="movie-llm-training",
+                    config=vars(self.config),
+                    settings=wandb.Settings(start_method="thread")
+                )
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.warning(f"Failed to initialize wandb after {max_retries} attempts. "
+                                   f"Continuing without wandb tracking. Error: {e}")
+                    self.config.use_wandb = False
+                else:
+                    logger.warning(
+                        f"Wandb initialization attempt {attempt + 1} failed. Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
 
     def save_checkpoint(self, val_loss: float, is_best: bool = False) -> None:
         """Save model checkpoint"""
@@ -408,101 +543,127 @@ class MovieLLMTrainer:
         return avg_val_loss
 
     def train(self) -> None:
-        """Main training loop"""
+        """Main training loop with improved error handling and memory management"""
         logger.info(f"Starting training on device: {self.device}")
         logger.info(f"Total training steps: {self.max_train_steps}")
 
         progress_bar = tqdm(total=self.max_train_steps, desc="Training")
 
-        for epoch in range(self.config.num_epochs):
-            self.model.train()
-            epoch_loss = 0
+        try:
+            for epoch in range(self.config.num_epochs):
+                self.model.train()
+                epoch_loss = 0
 
-            for step, batch in enumerate(self.train_dataloader):
-                # Move batch to device
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+                for step, batch in enumerate(self.train_dataloader):
+                    try:
+                        # Move batch to device and handle memory
+                        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                            input_ids = batch['input_ids'].to(self.device)
+                            attention_mask = batch['attention_mask'].to(self.device)
+                            labels = batch['labels'].to(self.device)
 
-                # Forward pass
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+                            # Forward pass
+                            outputs = self.model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels
+                            )
 
-                loss = outputs.loss / self.config.gradient_accumulation_steps
-                loss.backward()
+                            loss = outputs.loss / self.config.gradient_accumulation_steps
+                            loss.backward()
 
-                epoch_loss += loss.item()
+                            epoch_loss += loss.item()
 
-                # Update weights if we've accumulated enough gradients
-                if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.max_grad_norm
-                    )
+                        # Update weights if we've accumulated enough gradients
+                        if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.config.max_grad_norm
+                            )
 
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                    self.optimizer.zero_grad()
+                            self.optimizer.step()
+                            self.lr_scheduler.step()
+                            self.optimizer.zero_grad()
 
-                    self.global_step += 1
-                    progress_bar.update(1)
+                            self.global_step += 1
+                            progress_bar.update(1)
 
-                    # Log metrics
-                    if self.config.use_wandb:
-                        wandb.log({
-                            'train_loss': loss.item(),
-                            'learning_rate': self.optimizer.param_groups[0]['lr'],
-                            'global_step': self.global_step
-                        })
+                            # Log metrics with error handling
+                            if self.config.use_wandb:
+                                try:
+                                    wandb.log({
+                                        'train_loss': loss.item(),
+                                        'learning_rate': self.optimizer.param_groups[0]['lr'],
+                                        'global_step': self.global_step
+                                    })
+                                except Exception as e:
+                                    logger.warning(f"Failed to log to wandb: {e}")
+                                    self.config.use_wandb = False
 
-                    # Evaluate and save checkpoint if needed
-                    if self.global_step % self.config.eval_steps == 0:
-                        val_loss = self.evaluate()
+                            # Clean up CUDA memory
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
 
-                        # Log validation metrics
-                        if self.config.use_wandb:
-                            wandb.log({
-                                'val_loss': val_loss,
-                                'global_step': self.global_step
-                            })
+                            # Evaluate and save checkpoint if needed
+                            if self.global_step % self.config.eval_steps == 0:
+                                val_loss = self.evaluate()
 
-                        # Save checkpoint if it's the best model so far
-                        if val_loss < self.best_val_loss:
-                            self.best_val_loss = val_loss
-                            self.save_checkpoint(val_loss, is_best=True)
-                            logger.info(f"New best validation loss: {val_loss:.4f}")
+                                if self.config.use_wandb:
+                                    try:
+                                        wandb.log({
+                                            'val_loss': val_loss,
+                                            'global_step': self.global_step
+                                        })
+                                    except Exception as e:
+                                        logger.warning(f"Failed to log validation metrics to wandb: {e}")
 
-                    # Regular checkpoint saving
-                    if self.global_step % self.config.save_steps == 0:
-                        self.save_checkpoint(val_loss)
+                                if val_loss < self.best_val_loss:
+                                    self.best_val_loss = val_loss
+                                    self.save_checkpoint(val_loss, is_best=True)
+                                    logger.info(f"New best validation loss: {val_loss:.4f}")
 
-                    # Print progress
-                    if self.global_step % 100 == 0:
-                        elapsed = time.time() - self.start_time
-                        logger.info(
-                            f"Step: {self.global_step}, "
-                            f"Loss: {loss.item():.4f}, "
-                            f"Speed: {self.global_step / elapsed:.2f} steps/s"
-                        )
+                            # Regular checkpoint saving
+                            if self.global_step % self.config.save_steps == 0:
+                                self.save_checkpoint(val_loss)
 
-            # End of epoch
-            avg_epoch_loss = epoch_loss / len(self.train_dataloader)
-            logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs} - "
-                        f"Average loss: {avg_epoch_loss:.4f}")
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            logger.warning("CUDA out of memory. Attempting to recover...")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        else:
+                            raise e
 
-        # Training finished
-        logger.info("Training completed!")
-        if self.config.use_wandb:
-            wandb.finish()
+                # End of epoch logging
+                avg_epoch_loss = epoch_loss / len(self.train_dataloader)
+                logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs} - "
+                            f"Average loss: {avg_epoch_loss:.4f}")
 
+        except Exception as e:
+            logger.error(f"Training interrupted due to error: {e}")
+            # Save emergency checkpoint
+            self.save_checkpoint(float('inf'), is_emergency=True)
+            raise
+
+        finally:
+            # Cleanup
+            if self.config.use_wandb and wandb.run is not None:
+                wandb.finish()
+            progress_bar.close()
 
 def main():
     try:
-        # Initialize config
-        config = TrainingConfig()
+        # Set multiprocessing start method to 'spawn' for better compatibility
+        if sys.platform.startswith('win'):
+            torch.multiprocessing.set_start_method('spawn')
+
+        # Initialize config with reduced batch size and gradient accumulation
+        config = TrainingConfig(
+            batch_size=4,  # Reduced from 8
+            gradient_accumulation_steps=8,  # Increased from 4
+            max_length=384,  # Reduced from 512 to save memory
+        )
 
         # Initialize processor and load data
         processor = MovieDataProcessor()
@@ -515,21 +676,23 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(config.model_name)
         model.resize_token_embeddings(len(tokenizer))
 
-        # Create datasets and dataloaders
-        train_dataset, val_dataset, test_dataset = processor.create_datasets(tokenizer)
+        # Create datasets and dataloaders with reduced num_workers
+        train_dataset, val_dataset, test_dataset = processor.create_datasets(tokenizer, max_length=config.max_length)
 
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
-            num_workers=4
+            num_workers=2,  # Reduced from 4
+            pin_memory=True
         )
 
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=config.batch_size,
             shuffle=False,
-            num_workers=4
+            num_workers=2,  # Reduced from 4
+            pin_memory=True
         )
 
         # Initialize trainer
@@ -549,7 +712,6 @@ def main():
     except Exception as e:
         logger.error(f"Error in main execution: {e}")
         raise
-
 
 if __name__ == "__main__":
     main()
