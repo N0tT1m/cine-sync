@@ -1,555 +1,717 @@
-import torch
-import numpy as np
+import sys
+
 import pandas as pd
-from typing import List, Dict, Tuple, Optional, Union
-import logging
+import json
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from transformers import PreTrainedTokenizer, PreTrainedModel
-import random
-from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime
+import logging
+import os
+from pathlib import Path
+
+import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    get_linear_schedule_with_warmup, PreTrainedTokenizer
+)
+from pathlib import Path
+import time
+from datetime import datetime
+import wandb  # For tracking training progress
 from tqdm import tqdm
+import shutil
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@dataclass
+class ActorCredit:
+    media_id: int
+    media_type: str
+    title: str
+    character: str
+    release_date: str
+    genres: List[str]
+
 
 @dataclass
-class RecommendationConfig:
-    """Configuration for movie recommendation system"""
-    content_weight: float = 0.4  # Weight for content-based recommendations
-    collab_weight: float = 0.4  # Weight for collaborative filtering recommendations
-    llm_weight: float = 0.2  # Weight for LLM-based recommendations
-    top_k: int = 10  # Number of recommendations to return
-    diversity_factor: float = 0.2  # Factor to increase diversity in recommendations
-    min_rating_threshold: float = 3.5  # Minimum rating threshold for recommendations
-    use_cuda: bool = True  # Whether to use CUDA for LLM inference
+class Actor:
+    id: int
+    name: str
+    profile_path: Optional[str]
+    popularity: float
+    credits: List[ActorCredit]
 
 
-class MovieRecommender:
-    """Movie recommendation system that combines collaborative filtering,
-    content-based filtering, and LLM-based recommendations"""
+class MovieDataProcessor:
+    def __init__(self):
+        self.actors_data: Dict[int, Actor] = {}
+        self.movies_df: Optional[pd.DataFrame] = None
+        self.tv_df: Optional[pd.DataFrame] = None
+        self.statistics: Dict = {}
+        self.movielens_data: Dict[str, pd.DataFrame] = {}
+        self.netflix_data: Dict[str, pd.DataFrame] = {}
 
-    def __init__(
+    def load_all_data(self, movielens_path: str = './ml-32m',
+                      netflix_path: str = './archive',
+                      tmdb_path: str = './tmdb') -> None:
+        """Load all datasets from their respective paths"""
+        try:
+            logger.info("Starting to load all datasets...")
+
+            # Load MovieLens data
+            self.load_movielens_data(base_path=movielens_path)
+            logger.info("MovieLens data loaded successfully")
+
+            # Load Netflix data
+            self.load_netflix_data(base_path=netflix_path)
+            logger.info("Netflix data loaded successfully")
+
+            # Load TMDB data
+            self.load_tmdb_data(base_path=tmdb_path)
+            logger.info("TMDB data loaded successfully")
+
+            logger.info("All datasets loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Error loading all data: {e}")
+            raise
+
+    def load_movielens_data(self, base_path: str = './ml-32m') -> None:
+        """Load MovieLens dataset from multiple files"""
+        try:
+            # Load each file
+            files = {
+                'links': 'links.csv',
+                'movies': 'movies.csv',
+                'ratings': 'ratings.csv',
+                'tags': 'tags.csv'
+            }
+
+            for key, filename in files.items():
+                filepath = os.path.join(base_path, filename)
+                self.movielens_data[key] = pd.read_csv(filepath)
+                logger.info(f"Loaded MovieLens {key} data from {filepath}")
+
+            # Process movies data
+            self.movielens_data['movies']['genres'] = self.movielens_data['movies']['genres'].str.split('|')
+
+            # Process ratings data
+            self.movielens_data['ratings'].sort_values(['userId', 'timestamp'], inplace=True)
+
+            logger.info("Successfully loaded all MovieLens data")
+        except Exception as e:
+            logger.error(f"Error loading MovieLens data: {e}")
+            raise
+
+    def load_netflix_data(self, base_path: str = './archive') -> None:
+        """Load Netflix challenge dataset from multiple files"""
+        try:
+            # Load movie titles with proper handling of commas in titles
+            movie_titles_path = os.path.join(base_path, 'movie_titles.csv')
+
+            # Custom parsing for movie titles with explicit encoding
+            movies_data = []
+            with open(movie_titles_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    # Split only on first two commas
+                    parts = line.strip().split(',', 2)
+                    if len(parts) == 3:
+                        movie_id, year, title = parts
+                        movies_data.append({
+                            'movie_id': int(movie_id),
+                            'year': int(year) if year != 'NULL' else None,
+                            'title': title
+                        })
+                    else:
+                        logger.warning(f"Skipping malformed line: {line.strip()}")
+
+            self.netflix_data['movies'] = pd.DataFrame(movies_data)
+            logger.info(f"Loaded {len(movies_data)} movie titles")
+
+            # Initialize ratings dataframe
+            ratings_list = []
+
+            # Process each combined data file
+            for i in range(1, 5):
+                filename = f'combined_data_{i}.txt'
+                filepath = os.path.join(base_path, filename)
+                logger.info(f"Processing Netflix ratings file: {filename}")
+
+                current_movie_id = None
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.endswith(':'):
+                            current_movie_id = int(line[:-1])
+                        else:
+                            user_id, rating, date = line.split(',')
+                            ratings_list.append({
+                                'movie_id': current_movie_id,
+                                'user_id': int(user_id),
+                                'rating': float(rating),
+                                'date': pd.to_datetime(date)
+                            })
+
+                        # Process in chunks to manage memory
+                        if len(ratings_list) >= 1000000:
+                            chunk_df = pd.DataFrame(ratings_list)
+                            if 'ratings' not in self.netflix_data:
+                                self.netflix_data['ratings'] = chunk_df
+                            else:
+                                self.netflix_data['ratings'] = pd.concat([self.netflix_data['ratings'], chunk_df])
+                            ratings_list = []
+
+            # Process any remaining ratings
+            if ratings_list:
+                chunk_df = pd.DataFrame(ratings_list)
+                if 'ratings' not in self.netflix_data:
+                    self.netflix_data['ratings'] = chunk_df
+                else:
+                    self.netflix_data['ratings'] = pd.concat([self.netflix_data['ratings'], chunk_df])
+
+            logger.info("Successfully loaded all Netflix data")
+
+        except Exception as e:
+            logger.error(f"Error loading Netflix data: {e}")
+            raise
+
+    def load_tmdb_data(self, base_path: str = './tmdb') -> None:
+        """Load TMDB actor filmography data"""
+        try:
+            # Load movies data with explicit encoding
+            movies_path = os.path.join(base_path, 'actor_filmography_data_movies.csv')
+            self.movies_df = pd.read_csv(movies_path, encoding='utf-8')
+
+            # Load TV data with explicit encoding
+            tv_path = os.path.join(base_path, 'actor_filmography_data_tv.csv')
+            self.tv_df = pd.read_csv(tv_path, encoding='utf-8')
+
+            # Load JSON data with explicit encoding
+            json_path = os.path.join(base_path, 'actor_filmography_data.json')
+            with open(json_path, 'r', encoding='utf-8', errors='ignore') as f:
+                data = json.load(f)
+
+            for actor_id, actor_data in data.items():
+                actor = Actor(
+                    id=int(actor_id),
+                    name=actor_data['name'],
+                    profile_path=actor_data['profile_path'],
+                    popularity=actor_data['popularity'],
+                    credits=[
+                        ActorCredit(
+                            media_id=credit['media_id'],
+                            media_type=credit['media_type'],
+                            title=credit['title'],
+                            character=credit['character'],
+                            release_date=credit['release_date'],
+                            genres=credit['genres']
+                        ) for credit in actor_data['credits']
+                    ]
+                )
+                self.actors_data[int(actor_id)] = actor
+
+            logger.info("Successfully loaded all TMDB data")
+        except Exception as e:
+            logger.error(f"Error loading TMDB data: {e}")
+            raise
+
+    def analyze_ratings_distribution(self) -> Dict:
+        """Analyze ratings distribution across different datasets"""
+        distributions = {}
+
+        if self.movielens_data and 'ratings' in self.movielens_data:
+            distributions['movielens'] = {
+                'mean': self.movielens_data['ratings']['rating'].mean(),
+                'median': self.movielens_data['ratings']['rating'].median(),
+                'std': self.movielens_data['ratings']['rating'].std(),
+                'count': len(self.movielens_data['ratings'])
+            }
+
+        if self.netflix_data and 'ratings' in self.netflix_data:
+            distributions['netflix'] = {
+                'mean': self.netflix_data['ratings']['rating'].mean(),
+                'median': self.netflix_data['ratings']['rating'].median(),
+                'std': self.netflix_data['ratings']['rating'].std(),
+                'count': len(self.netflix_data['ratings'])
+            }
+
+        return distributions
+
+    def calculate_statistics(self) -> Dict:
+        """Calculate comprehensive statistics from all datasets"""
+        stats = {}  # Initialize empty stats dictionary instead of calling super()
+
+        # Add MovieLens specific statistics
+        if self.movielens_data:
+            stats['movielens'] = {
+                'total_users': self.movielens_data['ratings'][
+                    'userId'].nunique() if 'ratings' in self.movielens_data else 0,
+                'total_movies': len(self.movielens_data['movies']) if 'movies' in self.movielens_data else 0,
+                'total_ratings': len(self.movielens_data['ratings']) if 'ratings' in self.movielens_data else 0,
+                'total_tags': len(self.movielens_data['tags']) if 'tags' in self.movielens_data else 0
+            }
+
+        # Add Netflix specific statistics
+        if self.netflix_data:
+            stats['netflix'] = {
+                'total_movies': len(self.netflix_data['movies']) if 'movies' in self.netflix_data else 0,
+                'total_ratings': len(self.netflix_data['ratings']) if 'ratings' in self.netflix_data else 0
+            }
+
+            if 'movies' in self.netflix_data and 'year' in self.netflix_data['movies'].columns:
+                stats['netflix']['year_range'] = {
+                    'min': int(self.netflix_data['movies']['year'].min()),
+                    'max': int(self.netflix_data['movies']['year'].max())
+                }
+
+        # Add TMDB specific statistics
+        if self.actors_data:
+            stats['tmdb'] = {
+                'total_actors': len(self.actors_data),
+                'total_movies': len(self.movies_df) if self.movies_df is not None else 0,
+                'total_tv_shows': len(self.tv_df) if self.tv_df is not None else 0
+            }
+
+        # Add ratings distribution
+        stats['ratings_distribution'] = self.analyze_ratings_distribution()
+
+        return stats
+
+    def export_processed_data(self, output_file: str) -> None:
+        """Export processed data to a JSON file"""
+        try:
+            output_data = {
+                'statistics': self.calculate_statistics(),
+                'timestamp': datetime.now().isoformat()
+            }
+
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"Successfully exported processed data to {output_file}")
+        except Exception as e:
+            logger.error(f"Error exporting processed data: {e}")
+            raise
+
+    def _prepare_training_texts(self) -> List[str]:
+        """Prepare text data for training from all available sources"""
+        training_texts = []
+
+        # Process MovieLens data
+        if self.movielens_data and 'movies' in self.movielens_data:
+            for _, movie in self.movielens_data['movies'].iterrows():
+                text = f"Movie Title: {movie['title']}\nGenres: {' | '.join(movie['genres'])}\n\n"
+                training_texts.append(text)
+
+        # Process Netflix data
+        if self.netflix_data and 'movies' in self.netflix_data:
+            for _, movie in self.netflix_data['movies'].iterrows():
+                year = str(movie['year']) if pd.notna(movie['year']) else 'Unknown'
+                text = f"Movie Title: {movie['title']}\nYear: {year}\n\n"
+                training_texts.append(text)
+
+        # Process TMDB actor data
+        if self.actors_data:
+            for actor_id, actor in self.actors_data.items():
+                credits_text = "\n".join([
+                    f"Title: {credit.title}\n"
+                    f"Role: {credit.character}\n"
+                    f"Type: {credit.media_type}\n"
+                    f"Genres: {' | '.join(credit.genres)}\n"
+                    for credit in actor.credits[:5]  # Limit to top 5 credits
+                ])
+
+                text = f"Actor: {actor.name}\nPopularity: {actor.popularity}\n\nCredits:\n{credits_text}\n\n"
+                training_texts.append(text)
+
+        return training_texts
+
+    def create_datasets(
             self,
-            processor,  # MovieDataProcessor instance with loaded data
-            model: PreTrainedModel,  # Trained language model
             tokenizer: PreTrainedTokenizer,
-            config: RecommendationConfig = None
-    ):
-        self.processor = processor
+            max_length: int = 512,
+            train_size: float = 0.8,
+            val_size: float = 0.1,
+            test_size: float = 0.1,
+            random_state: int = 42
+    ) -> Tuple[Dataset, Dataset, Dataset]:
+        """
+        Create training, validation, and test datasets from the processed movie data.
+
+        Args:
+            tokenizer: The tokenizer to use for encoding the texts
+            max_length: Maximum sequence length for the model
+            train_size: Proportion of data to use for training
+            val_size: Proportion of data to use for validation
+            test_size: Proportion of data to use for testing
+            random_state: Random seed for reproducibility
+
+        Returns:
+            Tuple of (train_dataset, val_dataset, test_dataset)
+        """
+        logger.info("Preparing training texts...")
+        all_texts = self._prepare_training_texts()
+
+        if not all_texts:
+            raise ValueError("No training texts available. Please ensure data is loaded properly.")
+
+        logger.info(f"Created {len(all_texts)} training examples")
+
+        # First split: separate test set
+        train_val_texts, test_texts = train_test_split(
+            all_texts,
+            test_size=test_size,
+            random_state=random_state
+        )
+
+        # Second split: separate train and validation sets
+        relative_val_size = val_size / (train_size + val_size)
+        train_texts, val_texts = train_test_split(
+            train_val_texts,
+            test_size=relative_val_size,
+            random_state=random_state
+        )
+
+        logger.info(f"Split sizes - Train: {len(train_texts)}, Val: {len(val_texts)}, Test: {len(test_texts)}")
+
+        # Create datasets
+        train_dataset = MovieDataset(train_texts, tokenizer, max_length)
+        val_dataset = MovieDataset(val_texts, tokenizer, max_length)
+        test_dataset = MovieDataset(test_texts, tokenizer, max_length)
+
+        return train_dataset, val_dataset, test_dataset
+
+# Add new TrainingConfig dataclass
+@dataclass
+class TrainingConfig:
+    output_dir: str = "./movie_llm_checkpoints"
+    model_name: str = "gpt2"  # Base model to start from
+    batch_size: int = 8
+    max_length: int = 512
+    learning_rate: float = 2e-5
+    num_epochs: int = 3
+    warmup_steps: int = 500
+    save_steps: int = 1000
+    eval_steps: int = 500
+    gradient_accumulation_steps: int = 4
+    max_grad_norm: float = 1.0
+    use_wandb: bool = True
+
+class MovieDataset(Dataset):
+    def __init__(self, texts: List[str], tokenizer: PreTrainedTokenizer, max_length: int = 512):
+        self.encodings = tokenizer(
+            texts,
+            truncation=True,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
+        self.labels = self.encodings['input_ids'].clone()
+
+    def __len__(self):
+        return len(self.encodings['input_ids'])
+
+    def __getitem__(self, idx):
+        return {
+            'input_ids': self.encodings['input_ids'][idx],
+            'attention_mask': self.encodings['attention_mask'][idx],
+            'labels': self.labels[idx]
+        }
+
+
+class MovieLLMTrainer:
+    def __init__(self, config: TrainingConfig, model: PreTrainedModel,
+                 tokenizer: PreTrainedTokenizerBase,
+                 train_dataloader: DataLoader, val_dataloader: DataLoader):
+        self.config = config
         self.model = model
         self.tokenizer = tokenizer
-        self.config = config or RecommendationConfig()
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
 
-        # Prepare device for model inference
-        self.device = torch.device("cuda" if torch.cuda.is_available() and self.config.use_cuda else "cpu")
+        # Set up device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self.model.to(self.device)
 
-        # Initialize recommendation components
-        self._initialize_recommendation_components()
+        # Initialize optimizer with gradient clipping
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config.learning_rate,
+            eps=1e-8  # Add epsilon for numerical stability
+        )
 
-    def _initialize_recommendation_components(self):
-        """Initialize various recommendation components based on available data"""
-        logger.info("Initializing recommendation components...")
+        # Calculate total training steps
+        num_update_steps_per_epoch = len(train_dataloader) // config.gradient_accumulation_steps
+        self.max_train_steps = config.num_epochs * num_update_steps_per_epoch
 
-        # Check if we have MovieLens data for content-based filtering
-        if self.processor.movielens_data and 'movies' in self.processor.movielens_data:
-            self._prepare_content_features()
-            logger.info("Content-based features prepared successfully")
-        else:
-            logger.warning("MovieLens data not available, content-based filtering will be limited")
+        # Initialize learning rate scheduler
+        self.lr_scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=config.warmup_steps,
+            num_training_steps=self.max_train_steps
+        )
 
-        # Check if we have ratings data for collaborative filtering
-        if self.processor.movielens_data and 'ratings' in self.processor.movielens_data:
-            self._prepare_user_item_matrix()
-            logger.info("User-item matrix prepared successfully for collaborative filtering")
-        else:
-            logger.warning("Ratings data not available, collaborative filtering will be limited")
+        # Create output directory
+        self.output_dir = Path(config.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Ensure model is ready for inference
-        self.model.eval()
-        logger.info("LLM prepared for generative recommendations")
+        # Initialize training tracking
+        self.global_step = 0
+        self.best_val_loss = float('inf')
+        self.start_time = time.time()
 
-    def _prepare_content_features(self):
-        """Prepare content-based features from movies metadata"""
-        try:
-            # Get movies data from MovieLens
-            movies_df = self.processor.movielens_data['movies']
+        # Initialize wandb with retry mechanism and error handling
+        if config.use_wandb:
+            self._init_wandb_with_retry()
 
-            # Create genre features as one-hot encoding
-            all_genres = set()
-            for genres_list in movies_df['genres']:
-                if isinstance(genres_list, list):
-                    all_genres.update(genres_list)
-
-            # Create genre feature matrix
-            self.genre_features = np.zeros((len(movies_df), len(all_genres)))
-            self.genre_labels = list(all_genres)
-
-            for i, genres_list in enumerate(movies_df['genres']):
-                if isinstance(genres_list, list):
-                    for genre in genres_list:
-                        if genre in self.genre_labels:
-                            genre_idx = self.genre_labels.index(genre)
-                            self.genre_features[i, genre_idx] = 1
-
-            # Store movie IDs for reference
-            self.movieId_to_idx = {movieId: i for i, movieId in enumerate(movies_df['movieId'])}
-            self.idx_to_movieId = {i: movieId for movieId, i in self.movieId_to_idx.items()}
-
-            # Calculate similarity matrix for content-based filtering
-            self.content_similarity = cosine_similarity(self.genre_features)
-
-            logger.info(f"Content features prepared for {len(movies_df)} movies")
-
-        except Exception as e:
-            logger.error(f"Error preparing content features: {e}")
-            # Create empty features as fallback
-            self.genre_features = np.array([])
-            self.genre_labels = []
-            self.content_similarity = np.array([])
-            self.movieId_to_idx = {}
-            self.idx_to_movieId = {}
-
-    def _prepare_user_item_matrix(self):
-        """Prepare user-item matrix for collaborative filtering"""
-        try:
-            # Get ratings data
-            ratings_df = self.processor.movielens_data['ratings']
-
-            # Create pivot table for user-item matrix
-            user_item_matrix = ratings_df.pivot_table(
-                index='userId',
-                columns='movieId',
-                values='rating',
-                fill_value=0
-            )
-
-            # Store matrix for collaborative filtering
-            self.user_item_matrix = user_item_matrix.values
-            self.user_id_mapping = {userId: i for i, userId in enumerate(user_item_matrix.index)}
-            self.movie_id_mapping = {movieId: i for i, movieId in enumerate(user_item_matrix.columns)}
-            self.inv_movie_id_mapping = {i: movieId for movieId, i in self.movie_id_mapping.items()}
-
-            # Calculate similarity matrix for item-based collaborative filtering
-            self.item_similarity = cosine_similarity(self.user_item_matrix.T)
-
-            logger.info(f"User-item matrix prepared with shape {self.user_item_matrix.shape}")
-
-        except Exception as e:
-            logger.error(f"Error preparing user-item matrix: {e}")
-            # Create empty matrix as fallback
-            self.user_item_matrix = np.array([])
-            self.user_id_mapping = {}
-            self.movie_id_mapping = {}
-            self.inv_movie_id_mapping = {}
-            self.item_similarity = np.array([])
-
-    def generate_text_for_movie(self, movie_info: Dict) -> str:
-        """Generate descriptive text for a movie using the trained LLM"""
-        try:
-            # Prepare prompt for the model
-            if 'title' in movie_info and 'genres' in movie_info:
-                genres_str = ' | '.join(movie_info['genres']) if isinstance(movie_info['genres'], list) else movie_info[
-                    'genres']
-                prompt = f"Movie Title: {movie_info['title']}\nGenres: {genres_str}\n\nDescription:"
-            else:
-                prompt = f"Describe a movie like {movie_info.get('title', 'this')}"
-
-            # Tokenize input
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-
-            # Generate text
-            with torch.no_grad():
-                output = self.model.generate(
-                    inputs["input_ids"],
-                    max_length=150,
-                    temperature=0.8,
-                    top_p=0.9,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
+    def _init_wandb_with_retry(self, max_retries=3, retry_delay=5):
+        """Initialize wandb with retry mechanism"""
+        for attempt in range(max_retries):
+            try:
+                if wandb.run is not None:
+                    wandb.finish()
+                wandb.init(
+                    project="movie-llm-training",
+                    config=vars(self.config),
+                    settings=wandb.Settings(start_method="thread")
                 )
-
-            # Decode and return generated text
-            generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
-
-            # Extract just the description part (after the prompt)
-            if "Description:" in generated_text:
-                description = generated_text.split("Description:")[1].strip()
-                return description
-
-            return generated_text
-
-        except Exception as e:
-            logger.error(f"Error generating text for movie: {e}")
-            return ""
-
-    def get_content_based_recommendations(self, movie_ids: List[int], n: int = 10) -> List[Dict]:
-        """Get content-based recommendations based on movie IDs"""
-        if not self.content_similarity.size or not movie_ids:
-            logger.warning("Content-based filtering unavailable or no input movies provided")
-            return []
-
-        try:
-            # Find movie indices
-            movie_indices = [self.movieId_to_idx.get(movie_id, -1) for movie_id in movie_ids]
-            movie_indices = [idx for idx in movie_indices if idx >= 0]
-
-            if not movie_indices:
-                logger.warning("None of the provided movie IDs were found in the content database")
-                return []
-
-            # Calculate average similarity to all input movies
-            sim_scores = np.zeros(self.content_similarity.shape[0])
-            for idx in movie_indices:
-                sim_scores += self.content_similarity[idx]
-
-            sim_scores = sim_scores / len(movie_indices)
-
-            # Get top similar movies
-            movie_scores = [(i, score) for i, score in enumerate(sim_scores) if i not in movie_indices]
-            movie_scores.sort(key=lambda x: x[1], reverse=True)
-            movie_indices = [i for i, _ in movie_scores[:n]]
-
-            # Get movie details
-            movies_df = self.processor.movielens_data['movies']
-            recommendations = []
-
-            for idx in movie_indices:
-                movie_id = self.idx_to_movieId[idx]
-                movie_info = movies_df.loc[movies_df['movieId'] == movie_id].iloc[0].to_dict()
-
-                recommendations.append({
-                    'movieId': int(movie_id),
-                    'title': movie_info['title'],
-                    'genres': movie_info['genres'],
-                    'score': float(sim_scores[idx]),
-                    'source': 'content'
-                })
-
-            return recommendations
-
-        except Exception as e:
-            logger.error(f"Error in content-based recommendations: {e}")
-            return []
-
-    def get_collaborative_recommendations(self, movie_ids: List[int], n: int = 10) -> List[Dict]:
-        """Get collaborative filtering recommendations based on movie IDs"""
-        if not self.item_similarity.size or not movie_ids:
-            logger.warning("Collaborative filtering unavailable or no input movies provided")
-            return []
-
-        try:
-            # Find movie indices in the item-similarity matrix
-            movie_indices = [self.movie_id_mapping.get(movie_id, -1) for movie_id in movie_ids]
-            movie_indices = [idx for idx in movie_indices if idx >= 0]
-
-            if not movie_indices:
-                logger.warning("None of the provided movie IDs were found in the collaborative filtering database")
-                return []
-
-            # Calculate average similarity to all input movies
-            sim_scores = np.zeros(self.item_similarity.shape[0])
-            for idx in movie_indices:
-                sim_scores += self.item_similarity[idx]
-
-            sim_scores = sim_scores / len(movie_indices)
-
-            # Get top similar movies
-            movie_scores = [(i, score) for i, score in enumerate(sim_scores) if i not in movie_indices]
-            movie_scores.sort(key=lambda x: x[1], reverse=True)
-            top_indices = [i for i, _ in movie_scores[:n]]
-
-            # Get movie details
-            movies_df = self.processor.movielens_data['movies']
-            recommendations = []
-
-            for idx in top_indices:
-                movie_id = self.inv_movie_id_mapping[idx]
-                if movie_id in movies_df['movieId'].values:
-                    movie_info = movies_df.loc[movies_df['movieId'] == movie_id].iloc[0].to_dict()
-
-                    recommendations.append({
-                        'movieId': int(movie_id),
-                        'title': movie_info['title'],
-                        'genres': movie_info.get('genres', []),
-                        'score': float(sim_scores[idx]),
-                        'source': 'collaborative'
-                    })
-
-            return recommendations
-
-        except Exception as e:
-            logger.error(f"Error in collaborative recommendations: {e}")
-            return []
-
-    def get_llm_recommendations(self, movie_ids: List[int], n: int = 5) -> List[Dict]:
-        """Generate recommendations by prompting the language model"""
-        if not movie_ids:
-            logger.warning("No input movies provided for LLM recommendations")
-            return []
-
-        try:
-            # Get movie details for the inputs
-            movies_df = self.processor.movielens_data['movies']
-            input_movies = []
-
-            for movie_id in movie_ids:
-                if movie_id in movies_df['movieId'].values:
-                    movie = movies_df.loc[movies_df['movieId'] == movie_id].iloc[0]
-                    input_movies.append({
-                        'title': movie['title'],
-                        'genres': movie['genres']
-                    })
-
-            if not input_movies:
-                logger.warning("None of the provided movie IDs were found in the database")
-                return []
-
-            # Prepare prompt for the model with movie titles and genres
-            movie_descriptions = []
-            for movie in input_movies:
-                genres_str = ' | '.join(movie['genres']) if isinstance(movie['genres'], list) else movie['genres']
-                movie_descriptions.append(f"- {movie['title']} ({genres_str})")
-
-            prompt = (
-                    "Based on these movies:\n" +
-                    "\n".join(movie_descriptions) +
-                    "\n\nRecommend five similar movies with titles and genres in this format:\n" +
-                    "1. Movie Title (Genre1 | Genre2)\n"
-            )
-
-            # Tokenize input
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-
-            # Generate text
-            with torch.no_grad():
-                output = self.model.generate(
-                    inputs["input_ids"],
-                    max_length=300,
-                    temperature=0.8,
-                    top_p=0.9,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-
-            # Decode generated text
-            generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
-
-            # Parse recommended movies from generated text
-            recommendations = []
-
-            # Extract just the recommendations part (after the prompt)
-            if "similar movies" in generated_text:
-                rec_text = generated_text.split("similar movies")[1].strip()
-
-                # Process each line
-                import re
-                movie_matches = re.findall(r'(?:\d+\.\s+)?(.*?)\s+\((.*?)\)', rec_text)
-
-                for i, (title, genres_str) in enumerate(movie_matches):
-                    if i >= n:
-                        break
-
-                    genres = [g.strip() for g in genres_str.split('|')]
-
-                    recommendations.append({
-                        'movieId': -1,  # No real movie ID for LLM-generated recommendations
-                        'title': title.strip(),
-                        'genres': genres,
-                        'score': 1.0 - (i * 0.1),  # Decreasing score based on position
-                        'source': 'llm',
-                        'description': self.generate_text_for_movie({'title': title, 'genres': genres})
-                    })
-
-            return recommendations
-
-        except Exception as e:
-            logger.error(f"Error in LLM recommendations: {e}")
-            return []
-
-    def enhance_recommendations_with_descriptions(self, recommendations: List[Dict]) -> List[Dict]:
-        """Add LLM-generated descriptions to recommendations"""
-        enhanced_recommendations = []
-
-        for rec in tqdm(recommendations, desc="Generating descriptions"):
-            if 'description' not in rec:
-                rec['description'] = self.generate_text_for_movie(rec)
-            enhanced_recommendations.append(rec)
-
-        return enhanced_recommendations
-
-    def diversify_recommendations(self, recommendations: List[Dict], diversity_factor: float = None) -> List[Dict]:
-        """Apply diversity factor to ensure varied recommendations"""
-        if not recommendations or len(recommendations) <= 1:
-            return recommendations
-
-        diversity_factor = diversity_factor or self.config.diversity_factor
-
-        # Group recommendations by genre
-        genre_groups = {}
-        for rec in recommendations:
-            genres = rec.get('genres', [])
-            if isinstance(genres, str):
-                genres = [genres]
-
-            for genre in genres:
-                if genre not in genre_groups:
-                    genre_groups[genre] = []
-                genre_groups[genre].append(rec)
-
-        # Rerank recommendations to promote diversity
-        seen_recs = set()
-        diversified_recs = []
-
-        # First, ensure we have at least one movie from each major genre
-        major_genres = sorted(genre_groups.keys(), key=lambda g: len(genre_groups[g]), reverse=True)
-
-        for genre in major_genres:
-            if len(diversified_recs) >= len(recommendations):
                 break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.warning(f"Failed to initialize wandb after {max_retries} attempts. "
+                                   f"Continuing without wandb tracking. Error: {e}")
+                    self.config.use_wandb = False
+                else:
+                    logger.warning(
+                        f"Wandb initialization attempt {attempt + 1} failed. Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
 
-            best_rec = None
-            best_score = -1
+    def save_checkpoint(self, val_loss: float, is_best: bool = False) -> None:
+        """Save model checkpoint"""
+        checkpoint = {
+            'epoch': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.lr_scheduler.state_dict(),
+            'val_loss': val_loss,
+            'config': self.config,
+        }
 
-            for rec in genre_groups[genre]:
-                rec_id = rec.get('movieId', -1)
-                if rec_id not in seen_recs and rec.get('score', 0) > best_score:
-                    best_rec = rec
-                    best_score = rec.get('score', 0)
+        # Save regular checkpoint
+        checkpoint_path = self.output_dir / f'checkpoint-{self.global_step}.pt'
+        torch.save(checkpoint, checkpoint_path)
 
-            if best_rec:
-                diversified_recs.append(best_rec)
-                seen_recs.add(best_rec.get('movieId', -1))
+        # If this is the best model so far, save it separately
+        if is_best:
+            best_path = self.output_dir / 'best_model.pt'
+            shutil.copy(checkpoint_path, best_path)
 
-        # Then fill in with the highest scoring remaining recommendations
-        remaining_recs = [rec for rec in recommendations if rec.get('movieId', -1) not in seen_recs]
-        remaining_recs.sort(key=lambda x: x.get('score', 0), reverse=True)
+        # Keep only the last 3 checkpoints to save space
+        checkpoints = sorted(self.output_dir.glob('checkpoint-*.pt'))
+        for checkpoint in checkpoints[:-3]:
+            checkpoint.unlink()
 
-        # Fill up to original length
-        while len(diversified_recs) < len(recommendations) and remaining_recs:
-            next_rec = remaining_recs.pop(0)
-            diversified_recs.append(next_rec)
-            seen_recs.add(next_rec.get('movieId', -1))
+    def evaluate(self) -> float:
+        """Evaluate the model on validation set"""
+        self.model.eval()
+        total_loss = 0
+        total_steps = 0
 
-        return diversified_recs
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
 
-    def recommend(self, movie_ids: List[int], n: int = None) -> List[Dict]:
-        """Main recommendation function that combines all methods"""
-        n = n or self.config.top_k
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
 
-        logger.info(f"Generating recommendations based on {len(movie_ids)} movies")
+                total_loss += outputs.loss.item()
+                total_steps += 1
 
-        # Get recommendations from each method
-        content_recs = self.get_content_based_recommendations(movie_ids, n=n * 2)
-        collab_recs = self.get_collaborative_recommendations(movie_ids, n=n * 2)
-        llm_recs = self.get_llm_recommendations(movie_ids, n=max(3, int(n * 0.5)))
+        avg_val_loss = total_loss / total_steps
+        return avg_val_loss
 
-        logger.info(
-            f"Generated {len(content_recs)} content-based, {len(collab_recs)} collaborative, and {len(llm_recs)} LLM recommendations")
+    def train(self) -> None:
+        """Main training loop with improved error handling and memory management"""
+        logger.info(f"Starting training on device: {self.device}")
+        logger.info(f"Total training steps: {self.max_train_steps}")
 
-        # Score normalization for each method
-        for recs in [content_recs, collab_recs, llm_recs]:
-            if recs:
-                max_score = max(rec.get('score', 0) for rec in recs)
-                min_score = min(rec.get('score', 0) for rec in recs)
-                score_range = max_score - min_score if max_score > min_score else 1.0
+        progress_bar = tqdm(total=self.max_train_steps, desc="Training")
 
-                for rec in recs:
-                    normalized_score = (rec.get('score', 0) - min_score) / score_range
-                    rec['normalized_score'] = normalized_score
+        try:
+            for epoch in range(self.config.num_epochs):
+                self.model.train()
+                epoch_loss = 0
 
-        # Combine all recommendations
-        all_recs = []
-        all_recs.extend(content_recs)
-        all_recs.extend(collab_recs)
-        all_recs.extend(llm_recs)
+                for step, batch in enumerate(self.train_dataloader):
+                    try:
+                        # Move batch to device and handle memory
+                        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                            input_ids = batch['input_ids'].to(self.device)
+                            attention_mask = batch['attention_mask'].to(self.device)
+                            labels = batch['labels'].to(self.device)
 
-        # Apply weights to each method
-        for rec in all_recs:
-            if rec['source'] == 'content':
-                rec['weighted_score'] = rec.get('normalized_score', 0) * self.config.content_weight
-            elif rec['source'] == 'collaborative':
-                rec['weighted_score'] = rec.get('normalized_score', 0) * self.config.collab_weight
-            elif rec['source'] == 'llm':
-                rec['weighted_score'] = rec.get('normalized_score', 0) * self.config.llm_weight
+                            # Forward pass
+                            outputs = self.model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels
+                            )
 
-        # Remove duplicates, preferring higher-scored recommendations
-        unique_recs = {}
-        for rec in all_recs:
-            title = rec.get('title', '').lower()
-            if title not in unique_recs or rec.get('weighted_score', 0) > unique_recs[title].get('weighted_score', 0):
-                unique_recs[title] = rec
+                            loss = outputs.loss / self.config.gradient_accumulation_steps
+                            loss.backward()
 
-        # Convert back to list and sort by weighted score
-        recommendations = list(unique_recs.values())
-        recommendations.sort(key=lambda x: x.get('weighted_score', 0), reverse=True)
+                            epoch_loss += loss.item()
 
-        # Apply diversity factor
-        recommendations = self.diversify_recommendations(recommendations)
+                        # Update weights if we've accumulated enough gradients
+                        if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.config.max_grad_norm
+                            )
 
-        # Truncate to requested number
-        recommendations = recommendations[:n]
+                            self.optimizer.step()
+                            self.lr_scheduler.step()
+                            self.optimizer.zero_grad()
 
-        # Add descriptions for the final recommendations
-        recommendations = self.enhance_recommendations_with_descriptions(recommendations)
+                            self.global_step += 1
+                            progress_bar.update(1)
 
-        logger.info(f"Returning {len(recommendations)} final recommendations")
-        return recommendations
+                            # Log metrics with error handling
+                            if self.config.use_wandb:
+                                try:
+                                    wandb.log({
+                                        'train_loss': loss.item(),
+                                        'learning_rate': self.optimizer.param_groups[0]['lr'],
+                                        'global_step': self.global_step
+                                    })
+                                except Exception as e:
+                                    logger.warning(f"Failed to log to wandb: {e}")
+                                    self.config.use_wandb = False
 
+                            # Clean up CUDA memory
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
 
-# Example usage
-def example_recommendation_flow(model_path="./movie_llm_checkpoints/best_model.pt"):
-    """Example of how to use the recommendation system with the trained model"""
+                            # Evaluate and save checkpoint if needed
+                            if self.global_step % self.config.eval_steps == 0:
+                                val_loss = self.evaluate()
+
+                                if self.config.use_wandb:
+                                    try:
+                                        wandb.log({
+                                            'val_loss': val_loss,
+                                            'global_step': self.global_step
+                                        })
+                                    except Exception as e:
+                                        logger.warning(f"Failed to log validation metrics to wandb: {e}")
+
+                                if val_loss < self.best_val_loss:
+                                    self.best_val_loss = val_loss
+                                    self.save_checkpoint(val_loss, is_best=True)
+                                    logger.info(f"New best validation loss: {val_loss:.4f}")
+
+                            # Regular checkpoint saving
+                            if self.global_step % self.config.save_steps == 0:
+                                self.save_checkpoint(val_loss)
+
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            logger.warning("CUDA out of memory. Attempting to recover...")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        else:
+                            raise e
+
+                # End of epoch logging
+                avg_epoch_loss = epoch_loss / len(self.train_dataloader)
+                logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs} - "
+                            f"Average loss: {avg_epoch_loss:.4f}")
+
+        except Exception as e:
+            logger.error(f"Training interrupted due to error: {e}")
+            # Save emergency checkpoint
+            self.save_checkpoint(float('inf'), is_emergency=True)
+            raise
+
+        finally:
+            # Cleanup
+            if self.config.use_wandb and wandb.run is not None:
+                wandb.finish()
+            progress_bar.close()
+
+def main():
     try:
-        # Initialize data processor
+        # Set multiprocessing start method to 'spawn' for better compatibility
+        if sys.platform.startswith('win'):
+            torch.multiprocessing.set_start_method('spawn')
+
+        # Initialize config with reduced batch size and gradient accumulation
+        config = TrainingConfig(
+            batch_size=4,  # Reduced from 8
+            gradient_accumulation_steps=8,  # Increased from 4
+            max_length=384,  # Reduced from 512 to save memory
+        )
+
+        # Initialize processor and load data
         processor = MovieDataProcessor()
-        processor.load_all_data()  # Load all datasets
+        processor.load_all_data()
 
-        # Load trained model
-        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
-        config = checkpoint['config']
-
+        # Initialize tokenizer and model
         tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         tokenizer.pad_token = tokenizer.eos_token
 
         model = AutoModelForCausalLM.from_pretrained(config.model_name)
         model.resize_token_embeddings(len(tokenizer))
-        model.load_state_dict(checkpoint['model_state_dict'])
 
-        # Initialize recommender
-        rec_config = RecommendationConfig(
-            content_weight=0.4,
-            collab_weight=0.4,
-            llm_weight=0.2,
-            top_k=10
+        # Create datasets and dataloaders with reduced num_workers
+        train_dataset, val_dataset, test_dataset = processor.create_datasets(tokenizer, max_length=config.max_length)
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=2,  # Reduced from 4
+            pin_memory=True
         )
 
-        recommender = MovieRecommender(
-            processor=processor,
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=2,  # Reduced from 4
+            pin_memory=True
+        )
+
+        # Initialize trainer
+        trainer = MovieLLMTrainer(
+            config=config,
             model=model,
             tokenizer=tokenizer,
-            config=rec_config
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader
         )
 
-        # Get recommendations
-        example_movies = [122, 1893, 79132]  # Example movie IDs from MovieLens
-        recommendations = recommender.recommend(example_movies)
+        # Start training
+        trainer.train()
 
-        # Display recommendations
-        print(f"\nRecommendations based on movie IDs: {example_movies}")
-        for i, rec in enumerate(recommendations):
-            print(f"{i + 1}. {rec['title']} ({', '.join(rec['genres'])})")
-            print(f"   Source: {rec['source']}, Score: {rec.get('weighted_score', 0):.3f}")
-            if 'description' in rec:
-                print(f"   Description: {rec['description'][:100]}...")
-            print()
-
-        return recommendations
+        logger.info("Training completed successfully!")
 
     except Exception as e:
-        logger.error(f"Error in example recommendation flow: {e}")
+        logger.error(f"Error in main execution: {e}")
         raise
+
+if __name__ == "__main__":
+    main()
