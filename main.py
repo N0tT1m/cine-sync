@@ -715,118 +715,189 @@ class MovieDataProcessor:
             movies_path = os.path.join(base_path, 'actor_filmography_data_movies.csv')
             logger.info(f"Loading TMDB movies from {movies_path}")
 
-            for chunk in pd.read_csv(movies_path, encoding='utf-8', chunksize=50000):
-                # Map DataFrame columns to our database schema
-                columns = ['id', 'title', 'release_date', 'popularity', 'vote_average', 'vote_count', 'overview']
-                values = list(chunk[columns].itertuples(index=False, name=None))
-                self.db.insert_many_with_progress('tmdb_movies', columns, values)
-                del chunk, values
-                gc.collect()
+            if os.path.exists(movies_path):
+                for chunk in pd.read_csv(movies_path, encoding='utf-8', chunksize=50000):
+                    # Check available columns first and map to expected columns
+                    available_columns = chunk.columns.tolist()
+                    expected_columns = ['id', 'title', 'release_date', 'popularity', 'vote_average', 'vote_count',
+                                        'overview']
+
+                    # Log column mismatch for debugging
+                    if not all(col in available_columns for col in expected_columns):
+                        logger.warning(
+                            f"Column mismatch in TMDB movies: Expected {expected_columns}, got {available_columns}")
+                        # Only use columns that exist in the file
+                        columns_to_use = [col for col in expected_columns if col in available_columns]
+                        # If id column is missing, we can't proceed with this file
+                        if 'id' not in columns_to_use:
+                            logger.error(f"Required column 'id' missing in TMDB movies CSV, skipping file")
+                            break
+                    else:
+                        columns_to_use = expected_columns
+
+                    # Extract only available columns
+                    values = []
+                    for _, row in chunk.iterrows():
+                        # Create a tuple with all expected columns, using None for missing ones
+                        row_values = []
+                        for col in expected_columns:
+                            row_values.append(row.get(col) if col in available_columns else None)
+                        values.append(tuple(row_values))
+
+                    self.db.insert_many_with_progress('tmdb_movies', expected_columns, values)
+                    del chunk, values
+                    gc.collect()
+            else:
+                logger.warning(f"TMDB movies file not found at {movies_path}")
 
             # Load TV data
             tv_path = os.path.join(base_path, 'actor_filmography_data_tv.csv')
             logger.info(f"Loading TMDB TV shows from {tv_path}")
 
-            for chunk in pd.read_csv(tv_path, encoding='utf-8', chunksize=50000):
-                # Map DataFrame columns to our database schema
-                columns = ['id', 'name', 'first_air_date', 'popularity', 'vote_average', 'vote_count', 'overview']
-                values = list(chunk[columns].itertuples(index=False, name=None))
-                self.db.insert_many_with_progress('tmdb_tv', columns, values)
-                del chunk, values
-                gc.collect()
+            if os.path.exists(tv_path):
+                for chunk in pd.read_csv(tv_path, encoding='utf-8', chunksize=50000):
+                    # Check available columns first and map to expected columns
+                    available_columns = chunk.columns.tolist()
+                    expected_columns = ['id', 'name', 'first_air_date', 'popularity', 'vote_average', 'vote_count',
+                                        'overview']
+
+                    # Log column mismatch for debugging
+                    if not all(col in available_columns for col in expected_columns):
+                        logger.warning(
+                            f"Column mismatch in TMDB TV: Expected {expected_columns}, got {available_columns}")
+                        # Only use columns that exist in the file
+                        columns_to_use = [col for col in expected_columns if col in available_columns]
+                        # If id column is missing, we can't proceed with this file
+                        if 'id' not in columns_to_use:
+                            logger.error(f"Required column 'id' missing in TMDB TV CSV, skipping file")
+                            break
+                    else:
+                        columns_to_use = expected_columns
+
+                    # Extract only available columns
+                    values = []
+                    for _, row in chunk.iterrows():
+                        # Create a tuple with all expected columns, using None for missing ones
+                        row_values = []
+                        for col in expected_columns:
+                            row_values.append(row.get(col) if col in available_columns else None)
+                        values.append(tuple(row_values))
+
+                    self.db.insert_many_with_progress('tmdb_tv', expected_columns, values)
+                    del chunk, values
+                    gc.collect()
+            else:
+                logger.warning(f"TMDB TV file not found at {tv_path}")
 
             # Load JSON data
             json_path = os.path.join(base_path, 'actor_filmography_data.json')
             logger.info(f"Loading TMDB actor data from {json_path}")
 
-            with open(json_path, 'r', encoding='utf-8', errors='ignore') as f:
-                data = json.load(f)
+            if os.path.exists(json_path):
+                with open(json_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    data = json.load(f)
 
-            # Process actors and their credits
-            actor_count = 0
-            actor_batch = []
-            credit_batch = []
-            genre_batch = []
+                # Process actors and their credits
+                actor_count = 0
+                actor_batch = []
+                credit_batch = []
+                genre_batch = []
 
-            for actor_id, actor_data in tqdm(data.items(), desc="Processing actors"):
-                try:
-                    actor_id = int(actor_id)
-                    actor_batch.append((
-                        actor_id,
-                        actor_data['name'],
-                        actor_data['profile_path'],
-                        actor_data['popularity']
-                    ))
+                for actor_id, actor_data in tqdm(data.items(), desc="Processing actors"):
+                    try:
+                        actor_id = int(actor_id)
 
-                    # Process credits for this actor
-                    for credit in actor_data['credits']:
-                        # Insert credit
-                        credit_id = len(credit_batch) + 1  # Use a temporary ID
-                        credit_batch.append((
-                            credit_id,
+                        # Check if required fields are present
+                        if not all(k in actor_data for k in ['name', 'profile_path', 'popularity', 'credits']):
+                            logger.warning(f"Skipping actor {actor_id} due to missing required fields")
+                            continue
+
+                        actor_batch.append((
                             actor_id,
-                            credit['media_id'],
-                            credit['media_type'],
-                            credit['title'],
-                            credit['character'],
-                            credit['release_date']
+                            actor_data['name'],
+                            actor_data['profile_path'],
+                            actor_data['popularity']
                         ))
 
-                        # Process genres for this credit
-                        for genre in credit['genres']:
-                            genre_batch.append((credit_id, genre))
+                        # Process credits for this actor
+                        for credit in actor_data['credits']:
+                            # Check if required fields are present in the credit
+                            if not all(k in credit for k in
+                                       ['media_id', 'media_type', 'title', 'character', 'release_date', 'genres']):
+                                continue
 
-                    actor_count += 1
+                            # Insert credit
+                            credit_id = len(credit_batch) + 1  # Use a temporary ID
+                            credit_batch.append((
+                                credit_id,
+                                actor_id,
+                                credit['media_id'],
+                                credit['media_type'],
+                                credit['title'],
+                                credit['character'],
+                                credit['release_date']
+                            ))
 
-                    # Insert in batches
-                    if actor_count % 1000 == 0:
-                        self.db.insert_many_with_progress('tmdb_actors',
-                                                          ['id', 'name', 'profile_path', 'popularity'],
-                                                          actor_batch)
-                        actor_batch = []
+                            # Process genres for this credit
+                            for genre in credit['genres']:
+                                genre_batch.append((credit_id, genre))
 
-                        self.db.insert_many_with_progress('tmdb_credits',
-                                                          ['id', 'actor_id', 'media_id', 'media_type', 'title',
-                                                           'character', 'release_date'],
-                                                          credit_batch)
-                        credit_batch = []
+                        actor_count += 1
 
-                        self.db.insert_many_with_progress('tmdb_genres',
-                                                          ['credit_id', 'genre'],
-                                                          genre_batch)
-                        genre_batch = []
+                        # Insert in batches
+                        if actor_count % 1000 == 0:
+                            self.db.insert_many_with_progress('tmdb_actors',
+                                                              ['id', 'name', 'profile_path', 'popularity'],
+                                                              actor_batch)
+                            actor_batch = []
 
-                        # Force garbage collection
-                        gc.collect()
+                            self.db.insert_many_with_progress('tmdb_credits',
+                                                              ['id', 'actor_id', 'media_id', 'media_type', 'title',
+                                                               'character', 'release_date'],
+                                                              credit_batch)
+                            credit_batch = []
 
-                except Exception as e:
-                    logger.warning(f"Error processing actor {actor_id}: {e}")
+                            self.db.insert_many_with_progress('tmdb_genres',
+                                                              ['credit_id', 'genre'],
+                                                              genre_batch)
+                            genre_batch = []
 
-            # Insert any remaining data
-            if actor_batch:
-                self.db.insert_many_with_progress('tmdb_actors',
-                                                  ['id', 'name', 'profile_path', 'popularity'],
-                                                  actor_batch)
+                            # Force garbage collection
+                            gc.collect()
 
-            if credit_batch:
-                self.db.insert_many_with_progress('tmdb_credits',
-                                                  ['id', 'actor_id', 'media_id', 'media_type', 'title', 'character',
-                                                   'release_date'],
-                                                  credit_batch)
+                    except Exception as e:
+                        logger.warning(f"Error processing actor {actor_id}: {e}")
 
-            if genre_batch:
-                self.db.insert_many_with_progress('tmdb_genres',
-                                                  ['credit_id', 'genre'],
-                                                  genre_batch)
+                # Insert any remaining data
+                if actor_batch:
+                    self.db.insert_many_with_progress('tmdb_actors',
+                                                      ['id', 'name', 'profile_path', 'popularity'],
+                                                      actor_batch)
 
-            # Calculate TMDB statistics
+                if credit_batch:
+                    self.db.insert_many_with_progress('tmdb_credits',
+                                                      ['id', 'actor_id', 'media_id', 'media_type', 'title', 'character',
+                                                       'release_date'],
+                                                      credit_batch)
+
+                if genre_batch:
+                    self.db.insert_many_with_progress('tmdb_genres',
+                                                      ['credit_id', 'genre'],
+                                                      genre_batch)
+            else:
+                logger.warning(f"TMDB actor data file not found at {json_path}")
+
+            # Calculate TMDB statistics even if some files are missing
             self._calculate_tmdb_statistics()
 
-            logger.info("Successfully loaded all TMDB data")
+            logger.info("TMDB data loading completed")
 
         except Exception as e:
             logger.error(f"Error loading TMDB data: {e}")
-            raise
+            # Store error in statistics for tracking
+            self.db.store_statistic('tmdb', 'load_error', str(e))
+            # Don't raise exception to allow the program to continue with other datasets
+            logger.info("Continuing despite TMDB data loading error")
 
     def _calculate_tmdb_statistics(self):
         """Calculate and store TMDB statistics with error handling"""
