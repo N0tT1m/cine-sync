@@ -105,7 +105,6 @@ class EMA:
         self.backup = {}
 
 
-
 class DatabaseManager:
     """Class to handle all database operations"""
 
@@ -273,19 +272,86 @@ class DatabaseManager:
         if self.conn:
             self.conn.close()
 
-    def insert_many_with_progress(self, table, columns, values, batch_size=10000):
-        """Insert multiple rows with progress tracking"""
-        placeholders = ",".join(["?"] * len(columns))
-        columns_str = ",".join(columns)
-        query = f"INSERT OR REPLACE INTO {table} ({columns_str}) VALUES ({placeholders})"
+    def check_row_exists(self, table, conditions):
+        """
+        Check if a row exists in a table based on specified conditions
 
+        Args:
+            table (str): Table name
+            conditions (dict): Dictionary mapping column names to values for the WHERE clause
+
+        Returns:
+            bool: True if row exists, False otherwise
+        """
+        where_clause = " AND ".join([f"{col} = ?" for col in conditions.keys()])
+        query = f"SELECT 1 FROM {table} WHERE {where_clause} LIMIT 1"
+
+        self.cursor.execute(query, tuple(conditions.values()))
+        return self.cursor.fetchone() is not None
+
+    def insert_many_with_progress(self, table, columns, values, batch_size=10000, check_duplicates=True):
+        """
+        Insert multiple rows with progress tracking and duplicate checking
+
+        Args:
+            table (str): Table name
+            columns (list): List of column names
+            values (list): List of tuples containing values to insert
+            batch_size (int): Size of batches for insertion
+            check_duplicates (bool): Whether to check for duplicates before insertion
+        """
         total_rows = len(values)
+        inserted_count = 0
+        skipped_count = 0
 
-        # Insert in batches
-        for i in tqdm(range(0, total_rows, batch_size), desc=f"Inserting into {table}"):
-            batch = values[i:i + batch_size]
-            self.cursor.executemany(query, batch)
-            self.conn.commit()
+        # Get primary key columns for this table
+        self.cursor.execute(f"PRAGMA table_info({table})")
+        table_info = self.cursor.fetchall()
+        pk_columns = [row[1] for row in table_info if row[5] > 0]  # column name where pk flag > 0
+
+        # If no primary keys found or duplicate checking disabled, use INSERT OR REPLACE
+        if not pk_columns or not check_duplicates:
+            placeholders = ",".join(["?"] * len(columns))
+            columns_str = ",".join(columns)
+            query = f"INSERT OR REPLACE INTO {table} ({columns_str}) VALUES ({placeholders})"
+
+            # Insert in batches
+            for i in tqdm(range(0, total_rows, batch_size), desc=f"Inserting into {table}"):
+                batch = values[i:i + batch_size]
+                self.cursor.executemany(query, batch)
+                self.conn.commit()
+                inserted_count += len(batch)
+
+        else:
+            # Use duplicate checking for tables with primary keys
+            placeholders = ",".join(["?"] * len(columns))
+            columns_str = ",".join(columns)
+            insert_query = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
+
+            # Get indices of primary key columns in the values tuple
+            pk_indices = [columns.index(col) for col in pk_columns if col in columns]
+
+            # Insert in batches with duplicate checking
+            for i in tqdm(range(0, total_rows, batch_size), desc=f"Processing {table}"):
+                batch = values[i:i + batch_size]
+                rows_to_insert = []
+
+                for row in batch:
+                    # Create conditions for checking if row exists
+                    conditions = {pk_columns[idx]: row[pk_indices[idx]] for idx in range(len(pk_indices))}
+
+                    if not self.check_row_exists(table, conditions):
+                        rows_to_insert.append(row)
+                    else:
+                        skipped_count += 1
+
+                if rows_to_insert:
+                    self.cursor.executemany(insert_query, rows_to_insert)
+                    self.conn.commit()
+                    inserted_count += len(rows_to_insert)
+
+        logger.info(f"Table {table}: {inserted_count} rows inserted, {skipped_count} duplicates skipped")
+        return inserted_count, skipped_count
 
     def get_statistics(self, category):
         """Retrieve statistics for a category"""
@@ -379,7 +445,6 @@ class DatabaseManager:
                 texts.append(text)
 
         return texts
-
 
 class MovieDataProcessor:
     def __init__(self, db_path=None):
