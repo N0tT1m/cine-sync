@@ -1,5 +1,4 @@
 import sys
-
 import pandas as pd
 import json
 from typing import Dict, List, Optional, Tuple
@@ -69,6 +68,42 @@ class Actor:
     profile_path: Optional[str]
     popularity: float
     credits: List[ActorCredit]
+
+class EMA:
+    """Exponential Moving Average for model parameters"""
+    def __init__(self, model, decay):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.register()
+
+    def register(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
 
 
 class DatabaseManager:
@@ -1085,12 +1120,13 @@ class MovieDataProcessor:
 
         return train_dataset, val_dataset, test_dataset
 
-# Add Training Config dataclass
+
+# Modified Training Config
 @dataclass
 class TrainingConfig:
     output_dir: str = "./movie_llm_checkpoints"
-    db_path: str = "./movie_data.sqlite"  # Path to the SQLite database
-    model_name: str = "gpt2"  # Base model to start from
+    db_path: str = "./movie_data.sqlite"
+    model_name: str = "gpt2"
     batch_size: int = 4
     max_length: int = 384
     learning_rate: float = 2e-5
@@ -1101,11 +1137,20 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
     use_wandb: bool = True
-    # Memory management options
-    use_fp16: bool = True  # Use mixed precision training
-    pin_memory: bool = True  # Pin memory for faster data transfer
-    num_workers: int = 2  # Dataloader workers
-    max_examples: int = 100000  # Limit training examples to save memory
+
+    # Improved CUDA configuration
+    use_fp16: bool = True
+    pin_memory: bool = True
+    num_workers: int = 2
+    max_examples: int = 100000
+    cuda_device_id: int = 0  # Specify which CUDA device to use
+    use_amp: bool = True  # Use automatic mixed precision
+    dynamic_batch_size: bool = True  # Dynamically adjust batch size
+    memory_efficient_fp16: bool = True  # Enable memory-efficient FP16
+    ema_decay: float = 0.999  # Exponential moving average for model weights
+    gradient_checkpointing: bool = True  # Enable gradient checkpointing to save memory
+    memory_monitoring: bool = True  # Enable periodic memory monitoring
+
 
 class MovieDataset(Dataset):
     def __init__(self, texts: List[str], tokenizer: PreTrainedTokenizer, max_length: int = 512):
@@ -1142,9 +1187,22 @@ class MovieLLMTrainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
 
-        # Set up device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {self.device}")
+        # Improved device selection
+        if torch.cuda.is_available():
+            # Select specific device if provided
+            if hasattr(config, 'cuda_device_id') and config.cuda_device_id < torch.cuda.device_count():
+                self.device = torch.device(f"cuda:{config.cuda_device_id}")
+            else:
+                self.device = torch.device("cuda:0")  # Default to first GPU
+
+            # Log GPU information
+            device_properties = torch.cuda.get_device_properties(self.device)
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(self.device)}")
+            logger.info(f"GPU Memory: {device_properties.total_memory / 1e9:.2f} GB")
+            logger.info(f"CUDA Capability: {device_properties.major}.{device_properties.minor}")
+        else:
+            self.device = torch.device("cpu")
+            logger.warning("CUDA not available, using CPU")
 
         # Create output directory
         self.output_dir = Path(config.output_dir)
@@ -1154,23 +1212,56 @@ class MovieLLMTrainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.start_time = time.time()
+        self.last_memory_check = time.time()
+        self.memory_check_interval = 60  # seconds
 
-        # Set up for possible mixed precision training
-        self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_fp16 and torch.cuda.is_available())
+        # Set up automatic mixed precision
+        self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp and torch.cuda.is_available())
+
+        # Track original batch size for dynamic adjustments
+        self.original_batch_size = config.batch_size
+        self.current_batch_size = config.batch_size
+
+        # Initialize exponential moving average if enabled
+        self.ema = None
 
     def setup_training(self):
-        """Initialize model, tokenizer, datasets, and optimizer"""
+        """Initialize model, tokenizer, datasets, and optimizer with improved CUDA handling"""
         logger.info("Setting up training components...")
+
+        # Pre-allocate CUDA cache if needed
+        if torch.cuda.is_available():
+            # Optional: Pre-allocate memory to reduce fragmentation
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+
+            # Benchmark mode can improve performance for fixed input sizes
+            torch.backends.cudnn.benchmark = True
+
+            # Monitor initial GPU memory
+            self._log_cuda_memory("Initial GPU memory state")
 
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Initialize model
+        # Initialize model with CUDA optimizations
         self.model = AutoModelForCausalLM.from_pretrained(self.config.model_name)
         self.model.resize_token_embeddings(len(self.tokenizer))
+
+        # Apply gradient checkpointing if enabled (saves memory)
+        if self.config.gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
+
+        # Move model to appropriate device
         self.model = self.model.to(self.device)
+
+        # Set up Exponential Moving Average if enabled
+        if hasattr(self.config, 'ema_decay') and self.config.ema_decay > 0:
+            self.ema = EMA(self.model, decay=self.config.ema_decay)
+            logger.info(f"Exponential Moving Average initialized with decay={self.config.ema_decay}")
 
         # Set up data processor
         processor = MovieDataProcessor(db_path=self.config.db_path)
@@ -1182,13 +1273,15 @@ class MovieLLMTrainer:
             max_examples=self.config.max_examples
         )
 
-        # Create dataloaders
+        # Create dataloaders with optimized settings for GPU
         self.train_dataloader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory
+            pin_memory=self.config.pin_memory and torch.cuda.is_available(),
+            drop_last=True,  # Dropping last batch ensures consistent batch sizes
+            persistent_workers=self.config.num_workers > 0,  # Keep workers alive between epochs
         )
 
         self.val_dataloader = DataLoader(
@@ -1196,10 +1289,11 @@ class MovieLLMTrainer:
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory
+            pin_memory=self.config.pin_memory and torch.cuda.is_available(),
+            persistent_workers=self.config.num_workers > 0,
         )
 
-        # Calculate total training steps for learning rate scheduling
+        # Calculate total training steps
         num_update_steps_per_epoch = len(self.train_dataloader) // self.config.gradient_accumulation_steps
         self.max_train_steps = self.config.num_epochs * num_update_steps_per_epoch
 
@@ -1207,7 +1301,9 @@ class MovieLLMTrainer:
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.config.learning_rate,
-            eps=1e-8  # Add epsilon for numerical stability
+            eps=1e-8,
+            weight_decay=0.01,  # Add weight decay for regularization
+            betas=(0.9, 0.999),  # Standard beta values
         )
 
         # Initialize learning rate scheduler
@@ -1221,7 +1317,81 @@ class MovieLLMTrainer:
         if self.config.use_wandb:
             self._init_wandb_with_retry()
 
+        # Check GPU memory usage after setup
+        if torch.cuda.is_available() and self.config.memory_monitoring:
+            self._log_cuda_memory("GPU memory after setup")
+
         logger.info("Training setup complete")
+
+    def _log_cuda_memory(self, context=""):
+        """Log CUDA memory usage for debugging and monitoring"""
+        if not torch.cuda.is_available():
+            return
+
+        device = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
+        if device.type != 'cuda':
+            return
+
+        # Get device index
+        device_idx = device.index if device.index is not None else 0
+
+        # Get memory stats
+        allocated = torch.cuda.memory_allocated(device_idx) / 1024 ** 2
+        reserved = torch.cuda.memory_reserved(device_idx) / 1024 ** 2
+        max_allocated = torch.cuda.max_memory_allocated(device_idx) / 1024 ** 2
+
+        # Get device properties for total memory
+        props = torch.cuda.get_device_properties(device_idx)
+        total = props.total_memory / 1024 ** 2
+
+        logger.info(f"{context}: "
+                    f"Allocated: {allocated:.2f}MB | "
+                    f"Reserved: {reserved:.2f}MB | "
+                    f"Max Allocated: {max_allocated:.2f}MB | "
+                    f"Total: {total:.2f}MB | "
+                    f"Utilization: {(allocated / total) * 100:.2f}%")
+
+        # Log to wandb if available
+        if self.config.use_wandb and wandb.run is not None:
+            try:
+                wandb.log({
+                    "cuda_allocated_mb": allocated,
+                    "cuda_reserved_mb": reserved,
+                    "cuda_utilization": (allocated / total) * 100,
+                    "global_step": self.global_step
+                })
+            except Exception as e:
+                logger.warning(f"Failed to log CUDA memory to wandb: {e}")
+
+    def _maybe_adjust_batch_size(self, oom_detected=False):
+        """Dynamically adjust batch size based on available memory or OOM errors"""
+        if not self.config.dynamic_batch_size:
+            return
+
+        if oom_detected:
+            # Reduce batch size on OOM
+            new_batch_size = max(1, self.current_batch_size // 2)
+            logger.warning(f"OOM detected. Reducing batch size from {self.current_batch_size} to {new_batch_size}")
+            self.current_batch_size = new_batch_size
+            return True
+
+        # Check if we should try to increase batch size
+        if torch.cuda.is_available() and self.global_step > 0 and self.global_step % 50 == 0:
+            # Get current utilization
+            device_idx = self.device.index if self.device.index is not None else 0
+            allocated = torch.cuda.memory_allocated(device_idx)
+            total = torch.cuda.get_device_properties(device_idx).total_memory
+            utilization = allocated / total
+
+            # If utilization is low and we're below original batch size, try increasing
+            if utilization < 0.7 and self.current_batch_size < self.original_batch_size:
+                new_batch_size = min(self.current_batch_size + 2, self.original_batch_size)
+                logger.info(
+                    f"Memory utilization is {utilization:.2f}. Increasing batch size from {self.current_batch_size} to {new_batch_size}")
+                self.current_batch_size = new_batch_size
+                return True
+
+        return False
 
     def _init_wandb_with_retry(self, max_retries=3, retry_delay=5):
         """Initialize wandb with retry mechanism"""
@@ -1234,6 +1404,17 @@ class MovieLLMTrainer:
                     config=vars(self.config),
                     settings=wandb.Settings(start_method="thread")
                 )
+                # Log initial system info
+                if torch.cuda.is_available():
+                    device_idx = self.device.index if self.device.index is not None else 0
+                    device_name = torch.cuda.get_device_name(device_idx)
+                    total_memory = torch.cuda.get_device_properties(device_idx).total_memory / 1e9
+
+                    wandb.log({
+                        "gpu_name": device_name,
+                        "gpu_memory_gb": total_memory,
+                        "cuda_version": torch.version.cuda,
+                    })
                 break
             except Exception as e:
                 if attempt == max_retries - 1:
@@ -1246,77 +1427,132 @@ class MovieLLMTrainer:
                     time.sleep(retry_delay)
 
     def save_checkpoint(self, val_loss: float, is_best: bool = False, is_emergency: bool = False) -> None:
-        """Save model checkpoint"""
-        checkpoint = {
-            'epoch': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.lr_scheduler.state_dict(),
-            'val_loss': val_loss,
-            'config': self.config,
-        }
+        """Save model checkpoint with proper error handling for CUDA devices"""
+        try:
+            # First move model to CPU for saving (prevents CUDA OOM errors during saving)
+            model_state_dict = {k: v.to("cpu") for k, v in self.model.state_dict().items()}
 
-        # Determine checkpoint file path
-        if is_emergency:
-            checkpoint_path = self.output_dir / 'emergency_checkpoint.pt'
-        else:
-            checkpoint_path = self.output_dir / f'checkpoint-{self.global_step}.pt'
+            checkpoint = {
+                'epoch': self.global_step,
+                'model_state_dict': model_state_dict,
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+                'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+                'val_loss': val_loss,
+                'config': vars(self.config),
+            }
 
-        # Save checkpoint
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Saved checkpoint to {checkpoint_path}")
+            # Save EMA state if used
+            if self.ema is not None:
+                checkpoint['ema_state'] = {k: v.to("cpu") for k, v in self.ema.shadow.items()}
 
-        # If this is the best model so far, save it separately
-        if is_best:
-            best_path = self.output_dir / 'best_model.pt'
-            shutil.copy(checkpoint_path, best_path)
-            logger.info(f"Saved best model with val_loss={val_loss:.4f}")
+            # Determine checkpoint file path
+            if is_emergency:
+                checkpoint_path = self.output_dir / 'emergency_checkpoint.pt'
+            else:
+                checkpoint_path = self.output_dir / f'checkpoint-{self.global_step}.pt'
 
-        # Keep only the last 3 checkpoints to save space (skip for emergency)
-        if not is_emergency:
-            checkpoints = sorted(list(self.output_dir.glob('checkpoint-*.pt')))
-            for checkpoint in checkpoints[:-3]:
-                checkpoint.unlink()
+            # Save checkpoint
+            torch.save(checkpoint, checkpoint_path)
+            logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+            # If this is the best model so far, save it separately
+            if is_best:
+                best_path = self.output_dir / 'best_model.pt'
+                shutil.copy(checkpoint_path, best_path)
+                logger.info(f"Saved best model with val_loss={val_loss:.4f}")
+
+            # Keep only the last 3 checkpoints to save space (skip for emergency)
+            if not is_emergency:
+                checkpoints = sorted(list(self.output_dir.glob('checkpoint-*.pt')))
+                for checkpoint in checkpoints[:-3]:
+                    checkpoint.unlink()
+
+            # Clean up memory after saving
+            del checkpoint, model_state_dict
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
+            # Try emergency save with minimal state
+            try:
+                minimal_checkpoint = {
+                    'global_step': self.global_step,
+                    'val_loss': val_loss
+                }
+                emergency_path = self.output_dir / 'emergency_minimal_checkpoint.pt'
+                torch.save(minimal_checkpoint, emergency_path)
+                logger.info(f"Saved minimal emergency checkpoint to {emergency_path}")
+            except Exception as e2:
+                logger.error(f"Even minimal checkpoint saving failed: {e2}")
 
     def evaluate(self) -> float:
-        """Evaluate the model on validation set"""
+        """Evaluate the model on validation set with proper CUDA memory management"""
         self.model.eval()
         total_loss = 0
         total_steps = 0
 
-        # Use mixed precision for evaluation as well
+        # Apply EMA weights for evaluation if enabled
+        if self.ema is not None:
+            self.ema.apply_shadow()
+
+        # Use mixed precision for evaluation
         with torch.no_grad():
             for batch in self.val_dataloader:
+                # Move data to device
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
 
-                with torch.cuda.amp.autocast(enabled=self.config.use_fp16 and torch.cuda.is_available()):
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels
-                    )
+                try:
+                    with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels
+                        )
 
-                total_loss += outputs.loss.item()
-                total_steps += 1
+                    total_loss += outputs.loss.item()
+                    total_steps += 1
 
-                # Clean up CUDA memory
-                del input_ids, attention_mask, labels, outputs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        logger.warning("CUDA OOM during evaluation - skipping batch")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        raise e
+
+                finally:
+                    # Clean up CUDA memory
+                    del input_ids, attention_mask, labels
+                    if 'outputs' in locals():
+                        del outputs
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        # Restore original weights if using EMA
+        if self.ema is not None:
+            self.ema.restore()
+
+        # Handle case where all batches were skipped
+        if total_steps == 0:
+            logger.warning("No valid steps during evaluation, returning inf loss")
+            return float('inf')
 
         avg_val_loss = total_loss / total_steps
         return avg_val_loss
 
     def train(self) -> None:
-        """Main training loop with improved memory management"""
+        """Main training loop with improved CUDA memory management"""
         # Set up all components
         self.setup_training()
 
         logger.info(f"Starting training on device: {self.device}")
-        logger.info(f"Total training steps: {self.max_train_steps}")
-        logger.info(f"Using mixed precision: {self.config.use_fp16 and torch.cuda.is_available()}")
+        logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
+        logger.info(f"Using mixed precision: {self.config.use_amp and torch.cuda.is_available()}")
+        logger.info(f"Gradient checkpointing: {self.config.gradient_checkpointing}")
 
         progress_bar = tqdm(total=self.max_train_steps, desc="Training")
 
@@ -1324,8 +1560,14 @@ class MovieLLMTrainer:
             for epoch in range(self.config.num_epochs):
                 self.model.train()
                 epoch_loss = 0
+                epoch_start_time = time.time()
 
                 for step, batch in enumerate(self.train_dataloader):
+                    # Periodically check memory if enabled
+                    if self.config.memory_monitoring and time.time() - self.last_memory_check > self.memory_check_interval:
+                        self._log_cuda_memory(f"GPU memory at step {self.global_step}")
+                        self.last_memory_check = time.time()
+
                     try:
                         # Move batch to device
                         input_ids = batch['input_ids'].to(self.device)
@@ -1333,7 +1575,7 @@ class MovieLLMTrainer:
                         labels = batch['labels'].to(self.device)
 
                         # Forward pass with mixed precision
-                        with torch.cuda.amp.autocast(enabled=self.config.use_fp16 and torch.cuda.is_available()):
+                        with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
                             outputs = self.model(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
@@ -1344,7 +1586,7 @@ class MovieLLMTrainer:
 
                         # Backward pass with gradient scaling for mixed precision
                         self.scaler.scale(loss).backward()
-                        epoch_loss += loss.item()
+                        epoch_loss += loss.item() * self.config.gradient_accumulation_steps
 
                         # Update weights if we've accumulated enough gradients
                         if (step + 1) % self.config.gradient_accumulation_steps == 0:
@@ -1359,7 +1601,11 @@ class MovieLLMTrainer:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                             self.lr_scheduler.step()
-                            self.optimizer.zero_grad()
+                            self.optimizer.zero_grad(set_to_none=True)  # Better memory efficiency
+
+                            # Update EMA
+                            if self.ema is not None:
+                                self.ema.update()
 
                             self.global_step += 1
                             progress_bar.update(1)
@@ -1370,20 +1616,24 @@ class MovieLLMTrainer:
                                     wandb.log({
                                         'train_loss': loss.item() * self.config.gradient_accumulation_steps,
                                         'learning_rate': self.optimizer.param_groups[0]['lr'],
-                                        'global_step': self.global_step
+                                        'batch_size': self.current_batch_size,
+                                        'global_step': self.global_step,
+                                        'epoch': epoch
                                     })
                                 except Exception as e:
                                     logger.warning(f"Failed to log to wandb: {e}")
                                     self.config.use_wandb = False
 
-                            # Clean up CUDA memory after update
-                            del input_ids, attention_mask, labels, outputs, loss
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-
                             # Evaluate and save checkpoint if needed
                             if self.global_step % self.config.eval_steps == 0:
+                                # Force garbage collection before evaluation
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+
                                 val_loss = self.evaluate()
+                                # Return model to training mode after evaluation
+                                self.model.train()
+
                                 logger.info(f"Step {self.global_step}: Validation Loss = {val_loss:.4f}")
 
                                 if self.config.use_wandb:
@@ -1403,33 +1653,94 @@ class MovieLLMTrainer:
 
                             # Regular checkpoint saving
                             if self.global_step % self.config.save_steps == 0:
+                                # Get validation loss if we don't have a recent one
+                                if self.global_step % self.config.eval_steps != 0:
+                                    val_loss = self.evaluate()
+                                    self.model.train()  # Return to training mode
                                 self.save_checkpoint(val_loss)
 
                     except RuntimeError as e:
                         if "out of memory" in str(e):
-                            logger.warning("CUDA out of memory. Attempting to recover...")
+                            logger.warning(f"CUDA out of memory at step {step}. Attempting to recover...")
+
+                            # Clear any tensors from memory
+                            if 'input_ids' in locals():
+                                del input_ids
+                            if 'attention_mask' in locals():
+                                del attention_mask
+                            if 'labels' in locals():
+                                del labels
+                            if 'outputs' in locals():
+                                del outputs
+                            if 'loss' in locals():
+                                del loss
+
+                            # Empty CUDA cache
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
 
-                            # Reduce batch size temporarily for the next few batches
-                            if hasattr(self.train_dataloader, 'batch_sampler') and hasattr(
-                                    self.train_dataloader.batch_sampler, 'batch_size'):
-                                old_batch_size = self.train_dataloader.batch_sampler.batch_size
-                                new_batch_size = max(1, old_batch_size // 2)
-                                logger.warning(
-                                    f"Temporarily reducing batch size from {old_batch_size} to {new_batch_size}")
-                                self.train_dataloader.batch_sampler.batch_size = new_batch_size
+                            # Try adjusting batch size
+                            batch_adjusted = self._maybe_adjust_batch_size(oom_detected=True)
 
-                                # Plan to restore batch size after a few steps
-                                restore_batch_size_step = self.global_step + 10
+                            # If we adjusted batch size, rebuild dataloader
+                            if batch_adjusted:
+                                # Re-create dataloader with new batch size
+                                self.train_dataloader = DataLoader(
+                                    self.train_dataloader.dataset,
+                                    batch_size=self.current_batch_size,
+                                    shuffle=True,
+                                    num_workers=self.config.num_workers,
+                                    pin_memory=self.config.pin_memory and torch.cuda.is_available(),
+                                    drop_last=True,
+                                )
+
+                                # Log new batch size
+                                logger.info(f"Recreated dataloader with batch size {self.current_batch_size}")
                             continue
                         else:
                             raise e
 
+                    finally:
+                        # Make sure to clean up any CUDA memory at the end of each step
+                        if 'input_ids' in locals():
+                            del input_ids
+                        if 'attention_mask' in locals():
+                            del attention_mask
+                        if 'labels' in locals():
+                            del labels
+                        if 'outputs' in locals():
+                            del outputs
+                        if 'loss' in locals():
+                            del loss
+
                 # End of epoch logging
+                epoch_time = time.time() - epoch_start_time
                 avg_epoch_loss = epoch_loss / len(self.train_dataloader)
                 logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs} - "
-                            f"Average loss: {avg_epoch_loss:.4f}")
+                            f"Average loss: {avg_epoch_loss:.4f} - "
+                            f"Time: {epoch_time:.2f}s")
+
+                # Save checkpoint at end of each epoch
+                val_loss = self.evaluate()
+                self.model.train()  # Return to training mode
+                self.save_checkpoint(val_loss, is_best=(val_loss < self.best_val_loss))
+
+                # Log epoch stats to wandb
+                if self.config.use_wandb:
+                    try:
+                        wandb.log({
+                            'epoch': epoch + 1,
+                            'epoch_loss': avg_epoch_loss,
+                            'epoch_time': epoch_time,
+                            'epoch_val_loss': val_loss
+                        })
+                    except Exception as e:
+                        logger.warning(f"Failed to log epoch stats to wandb: {e}")
+
+        except KeyboardInterrupt:
+            logger.info("Training interrupted by user")
+            # Save emergency checkpoint
+            self.save_checkpoint(float('inf'), is_emergency=True)
 
         except Exception as e:
             logger.error(f"Training interrupted due to error: {e}")
@@ -1438,34 +1749,61 @@ class MovieLLMTrainer:
             raise
 
         finally:
-            # Cleanup
+            # Final cleanup
             if self.config.use_wandb and wandb.run is not None:
                 wandb.finish()
             progress_bar.close()
-            logger.info("Training completed or interrupted")
 
+            # Final memory report
+            if torch.cuda.is_available() and self.config.memory_monitoring:
+                self._log_cuda_memory("Final GPU memory state")
+
+            logger.info("Training completed or interrupted")
 
 def main():
     try:
-        # Set multiprocessing start method to 'spawn' for better compatibility
-        if sys.platform.startswith('win'):
-            import multiprocessing
-            multiprocessing.set_start_method('spawn')
+        # Set multiprocessing start method to 'spawn' for better CUDA compatibility
+        import multiprocessing
+        if sys.platform.startswith('win') or sys.platform.startswith('darwin'):
+            # Windows and MacOS should use 'spawn'
+            multiprocessing.set_start_method('spawn', force=True)
+        else:
+            # On Linux, 'fork' is faster but can cause issues with CUDA
+            # 'spawn' is safer but slower
+            multiprocessing.set_start_method('spawn', force=True)
 
         # Set database path in a location with adequate storage
         db_path = os.path.expanduser("~/movie_data.sqlite")
 
-        # Initialize config with memory-optimized settings
+        # Initialize config with CUDA-optimized settings
         config = TrainingConfig(
             db_path=db_path,
-            batch_size=4,  # Small batch size
-            gradient_accumulation_steps=8,  # Accumulate gradients to compensate
-            max_length=384,  # Shorter sequences
-            use_fp16=True,  # Use mixed precision
-            max_examples=100000,  # Limit the number of examples
-            num_workers=2,  # Fewer workers
-            output_dir="./movie_llm_checkpoints"
+            batch_size=4,  # Start with small batch size
+            gradient_accumulation_steps=8,
+            max_length=384,
+            use_fp16=True,
+            use_amp=True,
+            max_examples=100000,
+            num_workers=2,
+            output_dir="./movie_llm_checkpoints",
+            dynamic_batch_size=True,
+            gradient_checkpointing=True,
+            memory_monitoring=True,
+            cuda_device_id=0  # Use first GPU by default
         )
+
+        # Print CUDA information before starting
+        if torch.cuda.is_available():
+            logger.info(f"CUDA available: {torch.cuda.is_available()}")
+            logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+            logger.info(f"CUDA current device: {torch.cuda.current_device()}")
+            for i in range(torch.cuda.device_count()):
+                logger.info(f"CUDA device {i}: {torch.cuda.get_device_name(i)}")
+                props = torch.cuda.get_device_properties(i)
+                logger.info(f"  Memory: {props.total_memory / 1e9:.2f} GB")
+                logger.info(f"  CUDA Capability: {props.major}.{props.minor}")
+        else:
+            logger.warning("CUDA is not available. Training will be slow on CPU.")
 
         # Initialize processor and load data
         processor = MovieDataProcessor(db_path=db_path)
