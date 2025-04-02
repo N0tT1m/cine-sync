@@ -1,3 +1,4 @@
+
 import sys
 import pandas as pd
 import json
@@ -70,7 +71,6 @@ class Actor:
     credits: List[ActorCredit]
 
 
-# Fix the EMA class to properly handle CUDA tensors
 class EMA:
     """Exponential Moving Average for model parameters"""
 
@@ -119,7 +119,6 @@ class EMA:
                 assert name in self.backup
                 param.data = self.backup[name]
         self.backup = {}
-
 
 class DatabaseManager:
     """Class to handle all database operations"""
@@ -1406,6 +1405,109 @@ class MovieLLMTrainer:
 
         logger.info("Training setup complete")
 
+    def _log_cuda_memory(self, context=""):
+        """Log CUDA memory usage for debugging and monitoring"""
+        if not torch.cuda.is_available():
+            return
+
+        device = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
+        if device.type != 'cuda':
+            return
+
+        # Get device index
+        device_idx = device.index if device.index is not None else 0
+
+        # Get memory stats
+        allocated = torch.cuda.memory_allocated(device_idx) / 1024 ** 2
+        reserved = torch.cuda.memory_reserved(device_idx) / 1024 ** 2
+        max_allocated = torch.cuda.max_memory_allocated(device_idx) / 1024 ** 2
+
+        # Get device properties for total memory
+        props = torch.cuda.get_device_properties(device_idx)
+        total = props.total_memory / 1024 ** 2
+
+        logger.info(f"{context}: "
+                    f"Allocated: {allocated:.2f}MB | "
+                    f"Reserved: {reserved:.2f}MB | "
+                    f"Max Allocated: {max_allocated:.2f}MB | "
+                    f"Total: {total:.2f}MB | "
+                    f"Utilization: {(allocated / total) * 100:.2f}%")
+
+        # Log to wandb if available
+        if self.config.use_wandb and wandb.run is not None:
+            try:
+                wandb.log({
+                    "cuda_allocated_mb": allocated,
+                    "cuda_reserved_mb": reserved,
+                    "cuda_utilization": (allocated / total) * 100,
+                    "global_step": self.global_step
+                })
+            except Exception as e:
+                logger.warning(f"Failed to log CUDA memory to wandb: {e}")
+
+    def _maybe_adjust_batch_size(self, oom_detected=False):
+        """Dynamically adjust batch size based on available memory or OOM errors"""
+        if not self.config.dynamic_batch_size:
+            return
+
+        if oom_detected:
+            # Reduce batch size on OOM
+            new_batch_size = max(1, self.current_batch_size // 2)
+            logger.warning(f"OOM detected. Reducing batch size from {self.current_batch_size} to {new_batch_size}")
+            self.current_batch_size = new_batch_size
+            return True
+
+        # Check if we should try to increase batch size
+        if torch.cuda.is_available() and self.global_step > 0 and self.global_step % 50 == 0:
+            # Get current utilization
+            device_idx = self.device.index if self.device.index is not None else 0
+            allocated = torch.cuda.memory_allocated(device_idx)
+            total = torch.cuda.get_device_properties(device_idx).total_memory
+            utilization = allocated / total
+
+            # If utilization is low and we're below original batch size, try increasing
+            if utilization < 0.7 and self.current_batch_size < self.original_batch_size:
+                new_batch_size = min(self.current_batch_size + 2, self.original_batch_size)
+                logger.info(
+                    f"Memory utilization is {utilization:.2f}. Increasing batch size from {self.current_batch_size} to {new_batch_size}")
+                self.current_batch_size = new_batch_size
+                return True
+
+        return False
+
+    def _init_wandb_with_retry(self, max_retries=3, retry_delay=5):
+        """Initialize wandb with retry mechanism"""
+        for attempt in range(max_retries):
+            try:
+                if wandb.run is not None:
+                    wandb.finish()
+                wandb.init(
+                    project="movie-llm-training",
+                    config=vars(self.config),
+                    settings=wandb.Settings(start_method="thread")
+                )
+                # Log initial system info
+                if torch.cuda.is_available():
+                    device_idx = self.device.index if self.device.index is not None else 0
+                    device_name = torch.cuda.get_device_name(device_idx)
+                    total_memory = torch.cuda.get_device_properties(device_idx).total_memory / 1e9
+
+                    wandb.log({
+                        "gpu_name": device_name,
+                        "gpu_memory_gb": total_memory,
+                        "cuda_version": torch.version.cuda,
+                    })
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.warning(f"Failed to initialize wandb after {max_retries} attempts. "
+                                   f"Continuing without wandb tracking. Error: {e}")
+                    self.config.use_wandb = False
+                else:
+                    logger.warning(
+                        f"Wandb initialization attempt {attempt + 1} failed. Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+
     def save_checkpoint(self, val_loss: float, is_best: bool = False, is_emergency: bool = False) -> None:
         """Save model checkpoint with proper error handling for CUDA devices"""
         try:
@@ -1746,6 +1848,7 @@ class MovieLLMTrainer:
             logger.info("Training completed or interrupted")
 
 
+# Fix in main() to ensure CUDA is properly used
 def main():
     try:
         # Set multiprocessing start method to 'spawn' for better CUDA compatibility
